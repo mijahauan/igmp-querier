@@ -1,0 +1,47 @@
+[Unit]
+Description=IGMP Querier Service for KA9Q-Radio
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# EDIT THIS LINE: Change 'enp1s0' to your actual interface name
+ExecStart=/usr/bin/python3 /usr/local/bin/igmp_querier.py --interface enp1s0
+
+# Restart automatically if it crashes
+Restart=always
+RestartSec=5
+
+# Security Hardening: Run with minimal privileges
+# Only CAP_NET_RAW is needed for raw sockets, no need for full root
+User=nobody
+Group=nogroup
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=true
+
+# Filesystem protection
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/
+
+# Network namespace (allow network access)
+PrivateNetwork=false
+
+# Misc hardening
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=igmp-querier
+
+[Install]
+WantedBy=multi-user.target
