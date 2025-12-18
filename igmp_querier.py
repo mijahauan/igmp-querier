@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
-Simple IGMP Querier with Election Support
-Author: Mija Hauan (adapted for KA9Q-Radio support)
+Robust IGMP Querier with Election Support
+Author: Michael James Hauan (adapted for KA9Q-Radio support)
 License: MIT
 Description: 
     Sends periodic IGMPv2 General Queries to keep multicast streams alive 
     on switches with IGMP Snooping enabled but no active Querier.
     Implements RFC 2236 election logic (lowest IP wins).
+    
+    Key Features:
+    - RFC 2236 compliant querier election (lowest IP wins)
+    - RFC 2113 Router Alert IP option for proper IGMP routing
+    - IGMPv3 query detection for election compatibility
+    - Query jitter to prevent network synchronization issues
+    - Automatic socket recovery and IP change detection
+    - Graceful shutdown with statistics
 """
 
 import socket
@@ -18,16 +26,23 @@ import sys
 import argparse
 import signal
 import logging
-from typing import Optional
+import random
+from typing import Optional, Tuple
 
 # --- Constants ---
 IGMP_ALL_SYSTEMS = "224.0.0.1"
 IGMP_TYPE_QUERY  = 0x11
+IGMP_TYPE_V3_QUERY = 0x11      # Same type, but with extended header
 DEFAULT_QUERY_INTERVAL = 60    # Seconds between queries (RFC default is 125, 60 is safer for home LANs)
 DEFAULT_QUERIER_TIMEOUT = 255  # ~2x Interval + buffer
 STARTUP_QUERY_COUNT = 3        # RFC 2236 recommends rapid queries at startup
 STARTUP_QUERY_INTERVAL = 5     # Seconds between startup queries
 MAX_CONSECUTIVE_ERRORS = 10    # Threshold before attempting socket recovery
+QUERY_JITTER_FRACTION = 0.25   # RFC 3376: Add up to 25% jitter to query interval
+
+# IP Header with Router Alert Option (RFC 2113)
+# This is required for IGMP packets to be properly processed by routers
+IP_ROUTER_ALERT_OPTION = bytes([0x94, 0x04, 0x00, 0x00])  # Router Alert, length 4, value 0
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -187,7 +202,15 @@ def calculate_checksum(data: bytes) -> int:
 
 
 def build_igmp_query(max_resp_time: int = 100) -> bytes:
-    """Construct an IGMPv2 General Query packet with computed checksum."""
+    """
+    Construct an IGMPv2 General Query packet with computed checksum.
+    
+    Args:
+        max_resp_time: Maximum response time in 1/10 second units (default 100 = 10 seconds)
+    
+    Returns:
+        8-byte IGMP query packet ready for transmission
+    """
     # IGMP Header: Type (0x11), Max Resp Time, Checksum (0 for calculation), Group (0.0.0.0)
     packet_no_checksum = struct.pack("!BBH4s", 
         IGMP_TYPE_QUERY, 
@@ -209,8 +232,39 @@ def build_igmp_query(max_resp_time: int = 100) -> bytes:
     return packet
 
 
+def calculate_query_jitter(base_interval: int) -> float:
+    """
+    Calculate a randomized query interval with jitter.
+    
+    Per RFC 3376, query intervals should include random jitter to prevent
+    synchronization of multiple queriers or hosts on the network.
+    
+    Args:
+        base_interval: The configured query interval in seconds
+    
+    Returns:
+        Jittered interval in seconds (base_interval * [0.75, 1.0])
+    """
+    jitter = random.uniform(0, QUERY_JITTER_FRACTION)
+    return base_interval * (1.0 - jitter)
+
+
 def create_socket(ip: str) -> Optional[socket.socket]:
-    """Create and configure the raw IGMP socket."""
+    """
+    Create and configure the raw IGMP socket.
+    
+    The socket is configured with:
+    - IP_HDRINCL disabled (kernel builds IP header, we add Router Alert via IP_OPTIONS)
+    - Router Alert IP option (RFC 2113) for proper IGMP routing
+    - Multicast loopback enabled for self-detection
+    - 5 second timeout for graceful shutdown checks
+    
+    Args:
+        ip: The source IP address to bind to
+    
+    Returns:
+        Configured socket or None on failure
+    """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IGMP)
         
@@ -220,8 +274,15 @@ def create_socket(ip: str) -> Optional[socket.socket]:
         # Set Multicast Interface
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
         
+        # Add Router Alert option (RFC 2113) - required for proper IGMP routing
+        # This tells routers to examine the packet even if not addressed to them
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_OPTIONS, IP_ROUTER_ALERT_OPTION)
+        
         # Allow us to receive our own multicast packets
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        
+        # Set TTL to 1 (IGMP packets must not be forwarded beyond local network)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
         
         # Set a timeout so recvfrom doesn't block forever (allows checking state.running)
         sock.settimeout(5.0)
@@ -250,8 +311,47 @@ def send_query(sock: socket.socket) -> bool:
         return False
 
 
+def parse_igmp_query(igmp_data: bytes) -> Tuple[bool, int]:
+    """
+    Parse an IGMP query packet and determine its version.
+    
+    IGMPv1: 8 bytes, max_resp_time = 0
+    IGMPv2: 8 bytes, max_resp_time > 0  
+    IGMPv3: 12+ bytes (has additional fields)
+    
+    Args:
+        igmp_data: Raw IGMP packet data (after IP header)
+    
+    Returns:
+        Tuple of (is_valid_query, igmp_version)
+    """
+    if len(igmp_data) < 8:
+        return (False, 0)
+    
+    igmp_type = igmp_data[0]
+    if igmp_type != IGMP_TYPE_QUERY:
+        return (False, 0)
+    
+    max_resp_time = igmp_data[1]
+    
+    # IGMPv3 queries have at least 12 bytes
+    if len(igmp_data) >= 12:
+        return (True, 3)
+    elif max_resp_time == 0:
+        return (True, 1)
+    else:
+        return (True, 2)
+
+
 def listener_thread(sock: socket.socket):
-    """Listen for other IGMP queries to detect competitors."""
+    """
+    Listen for other IGMP queries to detect competitors.
+    
+    Implements RFC 2236 querier election:
+    - When we receive a query from a lower IP, we back off
+    - When we receive a query from a higher IP, we ignore it
+    - Handles IGMPv1, v2, and v3 queries for election purposes
+    """
     log.info("[Listener] Election listener started.")
     consecutive_errors = 0
     
@@ -280,27 +380,31 @@ def listener_thread(sock: socket.socket):
             ihl = ver_ihl & 0x0F
             ip_header_len = ihl * 4
             
-            # Validate IP header length
-            if ip_header_len < 20 or ip_header_len > len(data):
+            # Validate IP header length (minimum 20, maximum 60 bytes)
+            if ip_header_len < 20 or ip_header_len > 60 or ip_header_len > len(data):
                 log.debug(f"Invalid IP header length: {ip_header_len}")
                 continue
             
             # Parse IGMP
             igmp_data = data[ip_header_len:]
-            if len(igmp_data) < 8: 
-                continue 
-                
-            igmp_type = igmp_data[0]
+            is_query, igmp_version = parse_igmp_query(igmp_data)
+            
+            if not is_query:
+                continue
+            
+            # Log the query version for debugging
+            log.debug(f"Received IGMPv{igmp_version} query from {sender_ip_str}")
+            
+            # Election logic applies to all IGMP query versions
+            sender_val = ip_to_int(sender_ip_str)
+            my_val = ip_to_int(my_ip)
 
-            # If it's a Query (0x11)
-            if igmp_type == IGMP_TYPE_QUERY:
-                sender_val = ip_to_int(sender_ip_str)
-                my_val = ip_to_int(my_ip)
-
-                if sender_val < my_val:
-                    # They have a lower IP. They win.
-                    state.lose_election(sender_ip_str)
-                # else: We have the lower IP. We ignore them.
+            if sender_val < my_val:
+                # They have a lower IP. They win.
+                state.lose_election(sender_ip_str)
+            else:
+                # We have the lower IP. Log but continue as querier.
+                log.debug(f"Ignoring query from higher IP {sender_ip_str}")
             
             consecutive_errors = 0  # Reset on successful packet processing
 
@@ -441,7 +545,9 @@ def main():
                 log.warning(f"[Main] Interface IP changed from {state.my_ip} to {current_ip}")
                 state.listener_healthy = False  # Trigger recovery
             
-            time.sleep(args.query_interval)
+            # Use jittered interval to prevent synchronization (RFC 3376)
+            sleep_time = calculate_query_jitter(args.query_interval)
+            time.sleep(sleep_time)
     
     finally:
         # Graceful shutdown
