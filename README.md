@@ -186,7 +186,7 @@ sudo systemctl enable --now igmp-querier
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/igmp-querier.git
+git clone https://github.com/mijahauan/igmp-querier.git
 cd igmp-querier
 
 # Run the install script
