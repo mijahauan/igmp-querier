@@ -21,7 +21,7 @@ import socket
 import struct
 import time
 import threading
-import fcntl
+import subprocess
 import sys
 import argparse
 import signal
@@ -29,8 +29,13 @@ import logging
 import random
 from typing import Optional, Tuple
 
+IS_DARWIN = sys.platform == "darwin"
+if not IS_DARWIN:
+    import fcntl  # Linux SIOCGIFADDR path; macOS uses `ipconfig getifaddr`
+
 # --- Constants ---
 IGMP_ALL_SYSTEMS = "224.0.0.1"
+IP_BOUND_IF = 25               # macOS <netinet/in.h>; interface scoping (no SO_BINDTODEVICE there)
 IGMP_TYPE_QUERY  = 0x11
 IGMP_TYPE_V3_QUERY = 0x11      # Same type, but with extended header
 DEFAULT_QUERY_INTERVAL = 60    # Seconds between queries (RFC default is 125, 60 is safer for home LANs)
@@ -159,24 +164,50 @@ state = QuerierState()
 
 def get_ip_address(ifname: str) -> Optional[str]:
     """Retrieve the IP address of the specified interface."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        ip = socket.inet_ntoa(fcntl.ioctl(
-            s.fileno(),
-            0x8915,  # SIOCGIFADDR
-            struct.pack('256s', ifname[:15].encode('utf-8'))
-        )[20:24])
-        # Validate it's a proper unicast address
-        first_octet = int(ip.split('.')[0])
-        if first_octet < 1 or first_octet > 223 or first_octet == 127:
-            log.error(f"Interface '{ifname}' has non-unicast IP: {ip}")
+    if IS_DARWIN:
+        # No stdlib getifaddrs and Linux's SIOCGIFADDR value doesn't apply.
+        # ipconfig(8) answers for DHCP-configured services but returns nothing
+        # for manually-configured interfaces, so fall back to parsing ifconfig.
+        ip = ""
+        try:
+            result = subprocess.run(["ipconfig", "getifaddr", ifname],
+                                    capture_output=True, text=True, timeout=5)
+            ip = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if not ip:
+            try:
+                result = subprocess.run(["ifconfig", ifname],
+                                        capture_output=True, text=True, timeout=5)
+                for line in result.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("inet "):
+                        ip = line.split()[1]
+                        break
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if not ip:
+            log.error(f"Interface '{ifname}' not found or has no IPv4 address.")
             return None
-        return ip
-    except OSError:
-        log.error(f"Interface '{ifname}' not found or has no IPv4 address.")
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            ip = socket.inet_ntoa(fcntl.ioctl(
+                s.fileno(),
+                0x8915,  # SIOCGIFADDR
+                struct.pack('256s', ifname[:15].encode('utf-8'))
+            )[20:24])
+        except OSError:
+            log.error(f"Interface '{ifname}' not found or has no IPv4 address.")
+            return None
+        finally:
+            s.close()
+    # Validate it's a proper unicast address
+    first_octet = int(ip.split('.')[0])
+    if first_octet < 1 or first_octet > 223 or first_octet == 127:
+        log.error(f"Interface '{ifname}' has non-unicast IP: {ip}")
         return None
-    finally:
-        s.close()
+    return ip
 
 
 def ip_to_int(ip_str: str) -> int:
@@ -278,7 +309,11 @@ def create_socket(ip: str, iface: str) -> Optional[socket.socket]:
 
         # Interface scoping — constrains both send and receive to one iface
         # without the unicast-destination filter that bind((ip, 0)) imposes.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
+        if IS_DARWIN:
+            # macOS has no SO_BINDTODEVICE; IP_BOUND_IF scopes by interface index
+            sock.setsockopt(socket.IPPROTO_IP, IP_BOUND_IF, socket.if_nametoindex(iface))
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
 
         # Set Multicast Interface (source-IP selection for outgoing queries)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ip))
