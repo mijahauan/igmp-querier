@@ -24,6 +24,7 @@ import threading
 import subprocess
 import sys
 import argparse
+import re
 import signal
 import logging
 import random
@@ -160,6 +161,36 @@ class QuerierState:
 
 # Global state instance
 state = QuerierState()
+
+
+def resolve_interface(name: str) -> Optional[str]:
+    """Map the --interface argument to a concrete interface name.
+
+    A literal name is returned unchanged.  ``auto`` resolves to the
+    default-route interface at call time.  That is the LAN that carries
+    radiod's multicast, and resolving it at *start* rather than at *install*
+    is what lets one installed unit survive a move between machines: an
+    appliance image is built in a VM whose NIC is ``ens3`` and deployed to
+    VMs whose NIC is ``ens18`` (AI6VN 2026-09-05 -- the baked name failed
+    every 5 s for 130 restarts before anyone looked).
+    """
+    if name != "auto":
+        return name
+    try:
+        if IS_DARWIN:
+            out = subprocess.run(["route", "-n", "get", "default"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            m = re.search(r"^\s*interface:\s*(\S+)", out, re.M)
+        else:
+            out = subprocess.run(["ip", "-o", "route", "show", "default"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            m = re.search(r"\bdev\s+(\S+)", out)
+    except (OSError, subprocess.SubprocessError):
+        m = None
+    if not m:
+        log.error("--interface auto: no default route, cannot pick a LAN interface")
+        return None
+    return m.group(1)
 
 
 def get_ip_address(ifname: str) -> Optional[str]:
@@ -484,8 +515,9 @@ def main():
         description="Simple IGMP Querier Daemon",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("-i", "--interface", required=True, 
-                        help="Network interface to bind to (e.g., eth0, enp1s0)")
+    parser.add_argument("-i", "--interface", required=True,
+                        help="Network interface to bind to (e.g., eth0, enp1s0), "
+                             "or 'auto' for the default-route interface")
     parser.add_argument("-q", "--query-interval", type=int, default=DEFAULT_QUERY_INTERVAL,
                         help="Seconds between IGMP queries")
     parser.add_argument("-t", "--timeout", type=int, default=DEFAULT_QUERIER_TIMEOUT,
@@ -501,15 +533,19 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    state.interface = args.interface
-    
+    iface = resolve_interface(args.interface)
+    if iface is None:
+        sys.exit(1)
+    state.interface = iface
+
     # Get own IP
-    ip = get_ip_address(args.interface)
+    ip = get_ip_address(state.interface)
     if ip is None:
         sys.exit(1)
     state.my_ip = ip
-    
-    log.info(f"Starting IGMP Querier on {args.interface} ({state.my_ip})")
+
+    log.info(f"Starting IGMP Querier on {state.interface} ({state.my_ip})"
+             + (" [auto]" if args.interface == "auto" else ""))
     log.info(f"Query interval: {args.query_interval}s, Competitor timeout: {args.timeout}s")
     
     # Setup Raw Socket (Requires Root)
@@ -546,7 +582,13 @@ def main():
                 log.warning("[Main] Listener thread unhealthy, attempting recovery...")
                 sock.close()
                 
-                # Re-fetch IP in case it changed
+                # Re-resolve the interface (auto mode follows the default
+                # route) and re-fetch the IP in case either changed
+                if args.interface == "auto":
+                    new_if = resolve_interface("auto")
+                    if new_if and new_if != state.interface:
+                        log.info(f"[Main] Default-route interface changed from {state.interface} to {new_if}")
+                        state.interface = new_if
                 new_ip = get_ip_address(state.interface)
                 if new_ip is None:
                     log.error("[Main] Cannot recover: interface has no IP")

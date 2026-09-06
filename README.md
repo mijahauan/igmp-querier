@@ -210,7 +210,9 @@ sudo chmod +x /usr/local/bin/igmp_querier.py
 
 # Edit the service file to specify your interface
 nano igmp-querier.service
-# Change 'enp1s0' to your interface name on the ExecStart line
+# Change 'enp1s0' to your interface name on the ExecStart line, or to 'auto'
+# to follow the default-route interface (scripted installs write 'auto' so an
+# image built on one machine keeps working on another)
 
 # Install and enable the systemd service
 sudo cp igmp-querier.service /etc/systemd/system/
@@ -259,7 +261,8 @@ Simple IGMP Querier Daemon
 options:
   -h, --help            show this help message and exit
   -i INTERFACE, --interface INTERFACE
-                        Network interface to bind to (e.g., eth0, enp1s0)
+                        Network interface to bind to (e.g., eth0, enp1s0),
+                        or 'auto' for the default-route interface
   -q QUERY_INTERVAL, --query-interval QUERY_INTERVAL
                         Seconds between IGMP queries (default: 60)
   -t TIMEOUT, --timeout TIMEOUT

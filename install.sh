@@ -73,6 +73,16 @@ fi
 
 echo ""
 
+# IGMP_INTERFACE=auto: bind to the default-route interface at every START,
+# not to whatever name it has at install time.  This is what an image build
+# must use -- the name baked into the unit inside the build VM (ens3) is not
+# the name on the machine the image lands on (ens18), and the daemon then
+# fails every 5 s forever (AI6VN v3.37, 2026-09-05).  The detection below
+# still runs so a host with no usable LAN fails the install loudly.
+AUTO_IF=0
+if [[ "$IGMP_INTERFACE" == "auto" ]]; then AUTO_IF=1; IGMP_INTERFACE=""; fi
+SERVICE_IF=""
+
 # Pre-selected via IGMP_INTERFACE env var (sigmond / scripted path)?
 if [[ -n "$IGMP_INTERFACE" ]]; then
     SELECTED_IF=""
@@ -94,7 +104,7 @@ elif [[ ${#IF_LIST[@]} -eq 1 ]]; then
     SELECTED_IF="${IF_LIST[0]}"
     SELECTED_IP="${IP_LIST[0]}"
     echo_info "Only one interface found, using: $SELECTED_IF ($SELECTED_IP)"
-elif [[ $YES -eq 1 ]]; then
+elif [[ $YES -eq 1 || $AUTO_IF -eq 1 ]]; then
     # Non-interactive: the IGMP querier belongs on the LAN that carries radiod's
     # multicast — the default-route interface — never a VPN/virtual one.  Pick it
     # automatically; only bail if there's genuinely no obvious LAN interface.
@@ -136,6 +146,15 @@ else
     SELECTED_IP="${IP_LIST[$((selection-1))]}"
 fi
 
+# Scripted installs (--yes, or IGMP_INTERFACE=auto) get a unit that says
+# `--interface auto`, whichever branch above picked today's name -- including
+# the single-interface case, which is exactly what an image-build VM looks like
+# and exactly where a baked name goes stale.  An explicit IGMP_INTERFACE=<name>
+# and interactive choices keep the literal name the operator asked for.
+if [[ -z "$IGMP_INTERFACE" && ( $YES -eq 1 || $AUTO_IF -eq 1 ) ]]; then
+    SERVICE_IF="auto"
+fi
+
 echo ""
 echo_info "Selected interface: $SELECTED_IF ($SELECTED_IP)"
 
@@ -162,7 +181,8 @@ chmod +x "$INSTALL_PATH"
 
 # Create service file with selected interface
 echo_info "Installing systemd service..."
-sed "s/--interface enp1s0/--interface $SELECTED_IF/" "$SCRIPT_DIR/igmp-querier.service" > "$SERVICE_PATH"
+sed "s/--interface enp1s0/--interface ${SERVICE_IF:-$SELECTED_IF}/" "$SCRIPT_DIR/igmp-querier.service" > "$SERVICE_PATH"
+[[ -n "$SERVICE_IF" ]] && echo_info "Service binds with --interface auto (default route, resolved at each start; today: $SELECTED_IF)"
 
 # Reload systemd
 echo_info "Reloading systemd..."
