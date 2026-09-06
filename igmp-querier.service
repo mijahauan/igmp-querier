@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# EDIT THIS LINE: Change 'enp1s0' to your actual interface name
+# EDIT THIS LINE: Change 'enp1s0' to your actual interface name, or to 'auto'
+# to follow the default-route interface (what install.sh writes for scripted installs)
 ExecStart=/usr/bin/python3 /usr/local/bin/igmp_querier.py --interface enp1s0
 
 # Restart automatically if it crashes
